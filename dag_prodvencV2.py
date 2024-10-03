@@ -1,16 +1,13 @@
+import logging
+from datetime import timedelta
 from airflow import DAG
 from airflow.utils.dates import days_ago
-from tasks import extract_process_data, ingest_to_snowflake, update_processed_flags, stop_warehouse
-import logging
-from datetime import datetime, timedelta
-import pytz
-
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'retries': 3,
-    'retry_delay': timedelta(minutes=2),
-}
+from tasks import (
+    extract_process_data,
+    ingest_to_snowflake,
+    update_processed_flags,
+    stop_warehouse,
+)
 
 # Configuração do logging
 logging.basicConfig(
@@ -18,8 +15,16 @@ logging.basicConfig(
     format='[%(asctime)s] {%(filename)s:%(lineno)d} %(levelname)s - %(message)s',
 )
 
+# Definir argumentos padrão do DAG
+default_args = {
+    'owner': 'airflow',
+    'depends_on_past': False,
+    'retries': 3,
+    'retry_delay': timedelta(minutes=2),
+}
+
 with DAG(
-    dag_id='mongo_to_snowflake_etlV2',
+    dag_id='mongo_to_snowflake_etl',
     default_args=default_args,
     description='DAG para extrair dados do MongoDB, converter para Parquet e ingerir no Snowflake',
     schedule_interval='@daily',
@@ -27,9 +32,11 @@ with DAG(
     catchup=False,
 ) as dag:
 
-    extract_process_task = extract_process_data()
-    ingest_task = ingest_to_snowflake(extract_process_task)
+    # Definir a ordem das tarefas
+    extract_task = extract_process_data()
+    ingest_task = ingest_to_snowflake(extract_task)
     update_flags_task = update_processed_flags(ingest_task)
     stop_warehouse_task = stop_warehouse()
 
-    extract_process_task >> ingest_task >> update_flags_task >> stop_warehouse_task
+    # Definir a sequência de execução
+    extract_task >> ingest_task >> update_flags_task >> stop_warehouse_task

@@ -2,240 +2,261 @@ import logging
 import os
 import tempfile
 from datetime import datetime
+from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
 import pytz
 from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.hooks.base import BaseHook
 from airflow.providers.snowflake.hooks.snowflake import SnowflakeHook
 from pymongo import MongoClient
-import snowflake.connector
 
-from utils import getMongoDbCredentials
+from utils import getMongoCredentials
 
-# Configuração do logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s - %(message)s',
-)
-
-# Definir a timezone de São Paulo
+# Configurações globais
 SAO_PAULO_TZ = pytz.timezone('America/Sao_Paulo')
+SNOWFLAKE_CONN_ID = 'snowflake_default'
+SNOWFLAKE_TABLE_CONTROLE = 'BRONZE.CONTROLE_PRODVENC'
+SNOWFLAKE_STAGE = '@STAGE.PRODVENC'
+MONGO_COLLECTION_NAME = 'prodvenc'
 
-def get_snowflake_hook(conn_id='snowflake_default', timezone='America/Sao_Paulo'):
-    """Helper function to initialize a SnowflakeHook with the specified timezone."""
+def get_snowflake_hook(conn_id: str = SNOWFLAKE_CONN_ID) -> SnowflakeHook:
+    """
+    Inicializa um SnowflakeHook com o fuso horário especificado.
+
+    :param conn_id: ID da conexão do Snowflake no Airflow.
+    :return: Instância de SnowflakeHook.
+    """
     return SnowflakeHook(
         snowflake_conn_id=conn_id,
-        session_parameters={'TIMEZONE': timezone}
+        session_parameters={'TIMEZONE': 'America/Sao_Paulo'}
     )
 
-def execute_snowflake_query(hook, query, params=None, fetch_one=False):
-    """Helper function to execute a query using SnowflakeHook."""
-    with hook.get_conn() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, params)
-            if fetch_one:
-                return cursor.fetchone()
-            else:
-                return cursor.fetchall()
-
-@task
-def extract_process_data():
+def execute_snowflake_query(
+    hook: SnowflakeHook,
+    query: str,
+    params: Optional[Dict[str, Any]] = None,
+    fetch_one: bool = False
+) -> Any:
     """
-    Extracts data from MongoDB based on the last `DATA_UPLOAD` recorded in Snowflake,
-    processes the data, and saves it to a Parquet file.
+    Executa uma consulta no Snowflake usando o SnowflakeHook.
     """
     try:
-        # Initialize SnowflakeHook
-        snowflake_hook = get_snowflake_hook()
-        logging.info("Fetching the last DATA_UPLOAD from Snowflake.")
-
-        # Get the last DATA_UPLOAD
-        last_data_upload = execute_snowflake_query(
-            snowflake_hook,
-            "SELECT MAX(DATA_UPLOAD) AS last_data_upload FROM BRONZE.CONTROLE_PRODVENC",
-            fetch_one=True
-        )[0]
-        logging.info(f"Last DATA_UPLOAD retrieved: {last_data_upload}")
-
-        # Connect to MongoDB
-        mongo_uri = getMongoDbCredentials()
-        client = MongoClient(
-            f"mongodb://{mongo_uri['mongo_user']}:{mongo_uri['mongo_password']}@"
-            f"{mongo_uri['mongo_host']}:{mongo_uri['mongo_port']}/"
-            f"{mongo_uri['mongo_db']}?authSource={mongo_uri['mongo_authSource']}&"
-            f"readPreference={mongo_uri['mongo_readPreference']}&"
-            f"appname={mongo_uri['mongo_appname']}&"
-            f"replicaSet={mongo_uri['mongo_replicaSet']}&"
-            f"directConnection={mongo_uri['mongo_directConnection']}"
+        logging.debug(f"Executando consulta SQL: {query} com parâmetros: {params}")
+        return hook.run(
+            query,
+            parameters=params,
+            handler=lambda cur: cur.fetchone() if fetch_one else cur.fetchall()
         )
-        collection = client[mongo_uri["mongo_db"]]['prodvenc']
-        logging.info("Connected to MongoDB.")
+    except Exception as e:
+        logging.error(f"Erro ao executar a consulta no Snowflake: {e}")
+        raise AirflowFailException(f"Erro na consulta Snowflake: {e}")
 
-        # Prepare query for MongoDB
-        if last_data_upload:
-            if isinstance(last_data_upload, str):
-                last_data_upload = datetime.strptime(
-                    last_data_upload, '%Y-%m-%d %H:%M:%S'
-                ).replace(tzinfo=SAO_PAULO_TZ)
-            elif last_data_upload.tzinfo is None:
-                last_data_upload = last_data_upload.replace(tzinfo=SAO_PAULO_TZ)
-            query_mongo = {'data_registro': {'$gt': last_data_upload}}
-        else:
-            query_mongo = {}
-        logging.info(f"MongoDB query: {query_mongo}")
 
-        # Fetch documents from MongoDB
-        documentos = list(collection.find(query_mongo))
-        client.close()
-        logging.info(f"Documents found: {len(documentos)}")
+def get_last_data_upload(snowflake_hook: SnowflakeHook) -> Optional[datetime]:
+    """
+    Obtém a última DATA_UPLOAD registrada na tabela de controle no Snowflake.
 
-        if not documentos:
-            logging.info("No new documents to process. Skipping DAG.")
-            raise AirflowSkipException("No new documents to process.")
+    :param snowflake_hook: Instância de SnowflakeHook.
+    :return: Última data de upload ou None se não houver registros.
+    """
+    logging.info("Buscando o último DATA_UPLOAD no Snowflake.")
+    result = execute_snowflake_query(
+        snowflake_hook,
+        f"SELECT MAX(DATA_UPLOAD) FROM {SNOWFLAKE_TABLE_CONTROLE}",
+        fetch_one=True
+    )
+    last_data_upload = result[0] if result and result[0] else None
+    if last_data_upload:
+        last_data_upload = last_data_upload.replace(tzinfo=SAO_PAULO_TZ)
+    logging.info(f"Último DATA_UPLOAD obtido: {last_data_upload}")
+    return last_data_upload
 
-        # Process data
-        df = pd.DataFrame(documentos)
-        df['_id'] = df['_id'].astype(str)
-        for col in df.select_dtypes(include=['datetime64[ns]', 'datetime64[ns, UTC]']).columns:
-            df[col] = df[col].dt.tz_localize(SAO_PAULO_TZ, ambiguous='NaT', nonexistent='NaT')
+def prepare_mongo_query(last_data_upload: Optional[datetime]) -> Dict[str, Any]:
+    """
+    Prepara a consulta para o MongoDB baseada na última DATA_UPLOAD.
 
-        # Save to Parquet
-        data_extracao = datetime.now(SAO_PAULO_TZ)
-        nome_arquivo = f"mongodb_prodvenc_{data_extracao.strftime('%Y%m%d%H%M%S')}.parquet"
-        parquet_file_path = os.path.join(tempfile.gettempdir(), nome_arquivo)
-        df.to_parquet(parquet_file_path, index=False)
-        logging.info(f"Data exported to Parquet: {parquet_file_path}")
+    :param last_data_upload: Última data de upload ou None.
+    :return: Dicionário representando a consulta MongoDB.
+    """
+    if last_data_upload:
+        query = {'data_registro': {'$gt': last_data_upload}}
+    else:
+        query = {}
+    logging.debug(f"Consulta MongoDB: {query}")
+    return query
+
+def process_dataframe(documents: list) -> pd.DataFrame:
+    """
+    Processa a lista de documentos MongoDB em um DataFrame do Pandas.
+
+    :param documents: Lista de documentos do MongoDB.
+    :return: DataFrame processado.
+    """
+    df = pd.DataFrame(documents)
+    df['_id'] = df['_id'].astype(str)
+    datetime_cols = df.select_dtypes(include='datetime').columns
+    for col in datetime_cols:
+        df[col] = df[col].dt.tz_convert(SAO_PAULO_TZ) if df[col].dt.tz else df[col].dt.tz_localize(SAO_PAULO_TZ)
+    return df
+
+def save_to_parquet(df: pd.DataFrame, extraction_date: datetime) -> Tuple[str, str]:
+    """
+    Salva o DataFrame em um arquivo Parquet temporário.
+
+    :param df: DataFrame a ser salvo.
+    :param extraction_date: Data e hora da extração.
+    :return: Tupla contendo o caminho completo do arquivo Parquet e o nome do arquivo.
+    """
+    filename = f"mongodb_prodvenc_{extraction_date.strftime('%Y%m%d%H%M%S')}.parquet"
+    parquet_file_path = os.path.join(tempfile.gettempdir(), filename)
+    df.to_parquet(parquet_file_path, index=False)
+    logging.info(f"Dados exportados para Parquet: {parquet_file_path}")
+    return parquet_file_path, filename
+
+@task
+def extract_process_data() -> Dict[str, Any]:
+    """
+    Extrai dados do MongoDB com base na última DATA_UPLOAD registrada no Snowflake,
+    processa os dados e os salva em um arquivo Parquet.
+
+    :return: Dicionário com informações sobre o processamento.
+    """
+    try:
+        snowflake_hook = get_snowflake_hook()
+        last_data_upload = get_last_data_upload(snowflake_hook)
+
+        mongo_credentials = getMongoCredentials()
+        mongo_uri = mongo_credentials['mongo_uri']
+        mongo_db = mongo_credentials['mongo_db']
+        mongo_collection = mongo_credentials['mongo_collection']
+
+        extraction_date = datetime.now(SAO_PAULO_TZ)
+        mongo_query = prepare_mongo_query(last_data_upload)
+
+        logging.info("Conectando ao MongoDB.")
+        with MongoClient(mongo_uri) as client:
+            collection = client[mongo_db][mongo_collection]
+            documents = list(collection.find(mongo_query))
+            logging.info(f"{len(documents)} documentos encontrados no MongoDB.")
+
+        if not documents:
+            logging.info("Nenhum novo documento para processar. DAG será pulado.")
+            raise AirflowSkipException("Nenhum novo documento para processar.")
+
+        data_frame = process_dataframe(documents)
+        parquet_file_path, filename = save_to_parquet(data_frame, extraction_date)
 
         return {
             'parquet_path': parquet_file_path,
-            'nome_arquivo': nome_arquivo,
-            'total_registros': len(df),
-            'data_extracao': data_extracao
+            'filename': filename,
+            'total_records': len(data_frame),
+            'extraction_date': extraction_date.strftime('%Y-%m-%d %H:%M:%S')
         }
 
-    except Exception as e:
-        logging.error(f"Error in extract_process_data: {e}")
+    except AirflowSkipException:
+        # Repassa a exceção para que o Airflow possa lidar com o skip corretamente
         raise
+    except Exception as e:
+        logging.exception(f"Erro na tarefa extract_process_data: {e}")
+        raise AirflowFailException(f"Erro na extração e processamento de dados: {e}")
 
 @task
-def ingest_to_snowflake(processed_data: dict):
+def ingest_to_snowflake(processed_data: Dict[str, Any]) -> Dict[str, Optional[str]]:
     """
-    Ingests data from the Parquet file to Snowflake and updates the CONTROLE_PRODVENC table.
+    Ingere dados do arquivo Parquet para o Snowflake e atualiza a tabela de controle.
+
+    :param processed_data: Dicionário com informações sobre o processamento.
+    :return: Dicionário com o nome do arquivo processado.
     """
     try:
-        parquet_file_path = processed_data['parquet_path']
-        nome_arquivo = processed_data['nome_arquivo']
-        total_registros = processed_data.get('total_registros', 0)
-        data_extracao = processed_data.get('data_extracao')
+        parquet_file_path = processed_data.get('parquet_path')
+        filename = processed_data.get('filename')
+        total_records = processed_data.get('total_records', 0)
+        extraction_date = processed_data.get('extraction_date')
 
         if not parquet_file_path:
-            logging.info("No Parquet file to ingest.")
-            return {'nome_arquivo': None}
+            logging.warning("Nenhum arquivo Parquet para ingerir.")
+            return {'filename': None}
 
         snowflake_hook = get_snowflake_hook()
-        logging.info("Starting data ingestion to Snowflake.")
+        logging.info("Iniciando a ingestão de dados para o Snowflake.")
 
-        # Upload Parquet file to Snowflake stage
-        put_command = (
-            f"PUT file://{parquet_file_path} @BRONZE.PRODVENC/{nome_arquivo} AUTO_COMPRESS=TRUE"
-        )
+        put_command = f"PUT file://{parquet_file_path} {SNOWFLAKE_STAGE} AUTO_COMPRESS=TRUE"
         execute_snowflake_query(snowflake_hook, put_command)
-        logging.info(f"File {parquet_file_path} uploaded to stage as {nome_arquivo}.")
+        logging.info(f"Arquivo {filename} carregado para o stage {SNOWFLAKE_STAGE}.")
 
-        # Insert record into CONTROLE_PRODVENC
-        insert_query = """
-            INSERT INTO BRONZE.CONTROLE_PRODVENC (
-                NOME_ARQUIVO, DATA_UPLOAD, DATA_PROCESSAMENTO, FLAG_PROCESSADO, TOTAL_REGISTROS
+        insert_query = f"""
+            INSERT INTO {SNOWFLAKE_TABLE_CONTROLE} (
+                NOME_ARQUIVO, DATA_UPLOAD, FLAG_PROCESSADO, TOTAL_REGISTROS
             )
-            VALUES (%s, %s, NULL, FALSE, %s)
+            VALUES (%(filename)s, %(extraction_date)s, FALSE, %(total_records)s)
         """
-        execute_snowflake_query(
-            snowflake_hook,
-            insert_query,
-            params=(nome_arquivo, data_extracao, total_registros)
-        )
-        logging.info("Record inserted into CONTROLE_PRODVENC.")
+        params = {
+            'filename': filename,
+            'extraction_date': extraction_date,
+            'total_records': total_records
+        }
+        execute_snowflake_query(snowflake_hook, insert_query, params=params)
+        logging.info("Registro inserido na tabela de controle.")
 
-        # Remove temporary Parquet file
-        os.remove(parquet_file_path)
-        logging.info(f"Temporary Parquet file removed: {parquet_file_path}")
+        if os.path.exists(parquet_file_path):
+            os.remove(parquet_file_path)
+            logging.debug(f"Arquivo Parquet temporário removido: {parquet_file_path}")
+        else:
+            logging.warning(f"Arquivo Parquet não encontrado: {parquet_file_path}")
 
-        return {'nome_arquivo': nome_arquivo}
+        return {'filename': filename}
 
     except Exception as e:
-        logging.error(f"Error in ingest_to_snowflake: {e}")
-        raise
+        logging.exception(f"Erro na tarefa ingest_to_snowflake: {e}")
+        raise AirflowFailException(f"Erro na ingestão para o Snowflake: {e}")
 
 @task
-def update_processed_flags(data: dict):
+def update_processed_flags(data: Dict[str, Optional[str]]) -> None:
     """
-    Updates the CONTROLE_PRODVENC table in Snowflake after processing the data.
+    Atualiza a tabela de controle no Snowflake após o processamento dos dados.
+
+    :param data: Dicionário com o nome do arquivo processado.
     """
     try:
-        nome_arquivo = data.get('nome_arquivo')
-        if not nome_arquivo:
-            logging.info("No file to update in CONTROLE_PRODVENC.")
+        filename = data.get('filename')
+        if not filename:
+            logging.info("Nenhum arquivo para atualizar na tabela de controle.")
             return
 
         snowflake_hook = get_snowflake_hook()
-        logging.info("Updating CONTROLE_PRODVENC in Snowflake.")
+        logging.info("Atualizando a tabela de controle no Snowflake.")
 
-        update_query = """
-            UPDATE BRONZE.CONTROLE_PRODVENC
-            SET DATA_PROCESSAMENTO = %s,
+        update_query = f"""
+            UPDATE {SNOWFLAKE_TABLE_CONTROLE}
+            SET DATA_PROCESSAMENTO = CURRENT_TIMESTAMP(),
                 FLAG_PROCESSADO = TRUE
-            WHERE NOME_ARQUIVO = %s
+            WHERE NOME_ARQUIVO = %(filename)s
         """
-        data_processamento = datetime.now(SAO_PAULO_TZ)
-        execute_snowflake_query(
-            snowflake_hook,
-            update_query,
-            params=(data_processamento, nome_arquivo)
-        )
-        logging.info(f"CONTROLE_PRODVENC updated for file: {nome_arquivo}")
+        params = {'filename': filename}
+        execute_snowflake_query(snowflake_hook, update_query, params=params)
+        logging.info(f"Tabela de controle atualizada para o arquivo: {filename}")
 
     except Exception as e:
-        logging.error(f"Error in update_processed_flags: {e}")
-        raise
+        logging.exception(f"Erro na tarefa update_processed_flags: {e}")
+        raise AirflowFailException(f"Erro na atualização da tabela de controle: {e}")
 
 @task(trigger_rule='all_done')
-def stop_warehouse():
+def stop_warehouse() -> None:
     """
-    Stops the Snowflake warehouse after processing is complete.
+    Suspende o warehouse do Snowflake após a conclusão do processamento.
+
     """
     try:
         snowflake_hook = get_snowflake_hook()
-        conn = BaseHook.get_connection('snowflake_default')
-        warehouse_name = conn.extra_dejson.get('warehouse')
-
+        warehouse_name = snowflake_hook.get_connection(SNOWFLAKE_CONN_ID).extra_dejson.get('warehouse')
         if not warehouse_name:
-            raise ValueError("Warehouse name not found in connection extras.")
+            raise ValueError("Nome do warehouse não encontrado nas configurações da conexão.")
 
         suspend_query = f"ALTER WAREHOUSE {warehouse_name} SUSPEND"
         execute_snowflake_query(snowflake_hook, suspend_query)
-        logging.info(f"Warehouse suspended successfully.")
-
-    except snowflake.connector.errors.ProgrammingError as e:
-        error_message = str(e)
-        if "cannot be suspended" in error_message.lower() or "invalid state" in error_message.lower():
-            logging.warning(f"Warehouse cannot be suspended: {e}. It may already be suspended.")
-            # Optionally, you can check the warehouse status
-            try:
-                status_query = f"SHOW WAREHOUSES LIKE '{warehouse_name}'"
-                result = execute_snowflake_query(snowflake_hook, status_query, fetch_one=True)
-                if result:
-                    state = result[1]  # The state is usually in the second column
-                    logging.info(f"Warehouse current state: {state}")
-                else:
-                    logging.warning(f"Warehouse not found.")
-            except Exception as status_error:
-                logging.error(f"Error checking warehouse status: {status_error}")
-        else:
-            logging.error(f"Error in stop_warehouse: ")
-            raise AirflowFailException(f"Error in stop_warehouse: ")
+        logging.info(f"Warehouse {warehouse_name} suspenso com sucesso.")
 
     except Exception as e:
-        logging.error(f"Error in stop_warehouse: {e}")
-        raise AirflowFailException(f"Error in stop_warehouse: {e}")
+        logging.warning(f"Erro ao suspender o warehouse: {e}")

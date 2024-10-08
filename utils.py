@@ -1,15 +1,8 @@
+
+from airflow.models import Variable
 import json
 import logging
-from airflow.models import Variable
 
-def getMongoDbCredentials():
-    try:
-        variables_str = Variable.get("mongo_credentials")
-        variables = json.loads(variables_str)
-        MongoDB = variables['MongoDB_credentials_prodvenc']
-        logging.info(f"MongoDB credentials retrieved:")
-        return MongoDB
-    except json.JSONDecodeError as e:
-        raise
-    except KeyError as e:
-        raise
+def getMongoCredentials():
+    variavel_uri = Variable.get("mongo_credentials", deserialize_json=True)
+    return variavel_uri

@@ -12,11 +12,10 @@ from pymongo import MongoClient
 
 from utils import getMongoCredentials, parse_iso_date
 
-# Configurações globais
 SAO_PAULO_TZ = pytz.timezone('America/Sao_Paulo')
-SNOWFLAKE_CONN_ID = 'snowflake_default'
+SNOWFLAKE_CONN_ID = 'snowflake_default1'
 MONGO_COLLECTION_NAME = 'prodvenc'
-SNOWFLAKE_SCHEMA_STAGE = '@STAGE'
+SNOWFLAKE_SCHEMA_STAGE = '@STAGE.PRODVENC'
 SNOWFLAKE_SCHEMA_CONTROLE = 'BRONZE'
 
 def execute_snowflake_query(hook, query, params=None, fetch_one=False):
@@ -61,12 +60,48 @@ def get_mongo_documents(last_upload):
 def process_documents(documents):
     df = pd.DataFrame(documents)
     df['_id'] = df['_id'].astype(str)
+    
     if 'metadata' in df.columns:
-        df['metadata'] = df['metadata'].astype(str)
+        metadata_df = pd.json_normalize(df['metadata'])
+        
+        metadata_df = metadata_df.add_prefix('metadata_')
+        
+        datetime_cols_metadata = metadata_df.select_dtypes(include=['datetime64[ns, UTC]', 'datetime64[ns]']).columns
+        for col in datetime_cols_metadata:
+            metadata_df[col] = metadata_df[col].dt.tz_convert(SAO_PAULO_TZ) if metadata_df[col].dt.tz else metadata_df[col].dt.tz_localize(SAO_PAULO_TZ)
+            metadata_df[col] = metadata_df[col].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+        
+        df = df.drop(columns=['metadata'])
+        
+        df = df.reset_index(drop=True)
+        metadata_df = metadata_df.reset_index(drop=True)
+        
+        df = pd.concat([df, metadata_df], axis=1)
+    
+    if 'funcionario' in df.columns:
+        funcionario_df = pd.json_normalize(df['funcionario'])
+        
+        funcionario_df = funcionario_df.add_prefix('funcionario_')
+        
+        datetime_cols_funcionario = funcionario_df.select_dtypes(include=['datetime64[ns, UTC]', 'datetime64[ns]']).columns
+        for col in datetime_cols_funcionario:
+            funcionario_df[col] = funcionario_df[col].dt.tz_convert(SAO_PAULO_TZ) if funcionario_df[col].dt.tz else funcionario_df[col].dt.tz_localize(SAO_PAULO_TZ)
+            funcionario_df[col] = funcionario_df[col].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+        
+        df = df.drop(columns=['funcionario'])
+        
+        df = df.reset_index(drop=True)
+        funcionario_df = funcionario_df.reset_index(drop=True)
+        
+        df = pd.concat([df, funcionario_df], axis=1)
+    
     datetime_cols = df.select_dtypes(include=['datetime64[ns, UTC]', 'datetime64[ns]']).columns
     for col in datetime_cols:
         df[col] = df[col].dt.tz_convert(SAO_PAULO_TZ) if df[col].dt.tz else df[col].dt.tz_localize(SAO_PAULO_TZ)
+        df[col] = df[col].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+    
     return df
+
 
 def save_dataframe_to_parquet(df, extraction_date):
     filename = f"mongodb_prodvenc_{extraction_date.strftime('%Y%m%d%H%M%S')}.parquet"
@@ -88,7 +123,7 @@ def extract_and_ingest():
     parquet_path, filename = save_dataframe_to_parquet(df, extraction_date)
     
     # Uso das variáveis com caminho final
-    put_query = f"PUT file://{parquet_path} {SNOWFLAKE_SCHEMA_STAGE}.PRODVENC AUTO_COMPRESS=TRUE"
+    put_query = f"PUT file://{parquet_path} {SNOWFLAKE_SCHEMA_STAGE} AUTO_COMPRESS=TRUE"
     execute_snowflake_query(hook, put_query)
     
     insert_query = f"""
@@ -111,6 +146,7 @@ def extract_and_ingest():
     
     return filename
 
+
 @task
 def update_processed_flags(filename):
     if not filename:
@@ -123,6 +159,7 @@ def update_processed_flags(filename):
         WHERE NOME_ARQUIVO = %(filename)s
     """
     execute_snowflake_query(hook, update_query, params={'filename': filename})
+
 
 @task(trigger_rule='all_done')
 def stop_warehouse():

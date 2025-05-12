@@ -13,9 +13,9 @@ from pymongo import MongoClient
 from utils import getMongoCredentials, parse_iso_date
 
 SAO_PAULO_TZ = pytz.timezone('America/Sao_Paulo')
-SNOWFLAKE_CONN_ID = 'snowflake_default1'
-MONGO_COLLECTION_NAME = 'prodvenc'
-SNOWFLAKE_SCHEMA_STAGE = '@STAGE.PRODVENC'
+SNOWFLAKE_CONN_ID = 'nome-aqui'
+MONGO_COLLECTION_NAME = 'nome-aqui'
+SNOWFLAKE_SCHEMA_STAGE = 'nome-aqui'
 SNOWFLAKE_SCHEMA_CONTROLE = 'BRONZE'
 
 def execute_snowflake_query(hook, query, params=None, fetch_one=False):
